@@ -87,3 +87,17 @@ This project is best used with a home lab or virtual SOC setup that already has:
 - A Wazuh indexer
 - A Wazuh dashboard or Kibana
 - Optional Grafana and Proxmox access
+
+## Architecture and Design
+
+### Architecture
+
+![SIEM-Commander Architecture](docs/diagrams/siem-commander-architecture.png)
+
+### System Design
+
+![SIEM-Commander System Design](docs/diagrams/siem-commander-system-design.png)
+
+### Flowchart
+
+![SIEM-Commander Flowchart](docs/diagrams/siem-commander-flowchart.png)
