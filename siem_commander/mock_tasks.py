@@ -4,7 +4,6 @@ import argparse
 import sys
 import time
 
-
 ATTACK_SCRIPTS = {
     "nmap": [
         "Priming SYN stealth workflow for {target}",

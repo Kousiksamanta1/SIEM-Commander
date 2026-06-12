@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import ssl
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 
 class WazuhClientError(RuntimeError):
     """Raised when a Wazuh API or indexer request fails."""
+
+
+DEFAULT_TIMEOUT = 15.0
+MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+INDEX_PATTERN_RE = re.compile(r"^[A-Za-z0-9._,*-]+$")
 
 
 @dataclass(frozen=True)
@@ -20,7 +27,8 @@ class ConnectionSettings:
     username: str
     password: str
     verify_tls: bool = True
-    timeout: float = 10.0
+    ca_bundle: str = ""
+    timeout: float = DEFAULT_TIMEOUT
 
     @property
     def normalized_base_url(self) -> str:
@@ -36,10 +44,46 @@ def _basic_auth_header(username: str, password: str) -> str:
     return f"Basic {base64.b64encode(raw).decode('ascii')}"
 
 
-def _ssl_context(verify_tls: bool) -> ssl.SSLContext:
+def _ssl_context(verify_tls: bool, ca_bundle: str = "") -> ssl.SSLContext:
     if verify_tls:
+        if ca_bundle:
+            bundle = Path(ca_bundle).expanduser()
+            if not bundle.is_file():
+                raise WazuhClientError(f"CA certificate bundle does not exist: {bundle}")
+            return ssl.create_default_context(cafile=str(bundle))
         return ssl.create_default_context()
-    return ssl._create_unverified_context()  # type: ignore[attr-defined]
+    # Lab-only mode explicitly selected by the operator for self-signed deployments.
+    return ssl._create_unverified_context()  # nosec B323
+
+
+def _read_limited(response: Any, url: str) -> bytes:
+    content_length = response.headers.get("Content-Length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_RESPONSE_BYTES:
+                raise WazuhClientError(f"Response from {url} exceeds the {MAX_RESPONSE_BYTES}-byte limit.")
+        except ValueError:
+            pass
+
+    body = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(body) > MAX_RESPONSE_BYTES:
+        raise WazuhClientError(f"Response from {url} exceeds the {MAX_RESPONSE_BYTES}-byte limit.")
+    return body
+
+
+def _ensure_wazuh_success(payload: dict[str, Any], endpoint: str) -> None:
+    error = payload.get("error")
+    if error in (None, 0, "0"):
+        return
+    message = payload.get("message") or payload.get("detail") or "Unknown Wazuh API error"
+    raise WazuhClientError(f"Wazuh API error from {endpoint}: {message}")
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _first_affected_item(payload: dict[str, Any]) -> Any:
@@ -74,6 +118,11 @@ def _nested_get(payload: dict[str, Any], *path: str, default: Any = "") -> Any:
 class JsonHttpClient:
     def __init__(self, settings: ConnectionSettings) -> None:
         self.settings = settings
+        parsed_url = urlparse(settings.normalized_base_url)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
+            raise WazuhClientError("Connection URL must use http:// or https:// and include a hostname.")
+        if parsed_url.username or parsed_url.password:
+            raise WazuhClientError("Connection URL must not contain credentials.")
 
     def request(
         self,
@@ -89,7 +138,10 @@ class JsonHttpClient:
         if params:
             url = f"{url}?{urlencode(params)}"
 
-        request_headers = {"Accept": "application/json"}
+        request_headers = {
+            "Accept": "application/json",
+            "User-Agent": "SIEM-Commander/1.0",
+        }
         if headers:
             request_headers.update(headers)
 
@@ -100,18 +152,21 @@ class JsonHttpClient:
 
         request = Request(url, data=body, headers=request_headers, method=method.upper())
         try:
-            with urlopen(
+            # The constructor restricts base URLs to HTTP(S).
+            with urlopen(  # nosec B310
                 request,
                 timeout=self.settings.timeout,
-                context=_ssl_context(self.settings.verify_tls),
+                context=_ssl_context(self.settings.verify_tls, self.settings.ca_bundle),
             ) as response:
-                raw_text = _to_text(response.read())
+                raw_text = _to_text(_read_limited(response, url))
         except HTTPError as exc:
-            detail = _to_text(exc.read()).strip()
+            detail = _to_text(exc.read(4096)).strip()
             message = detail or exc.reason
             raise WazuhClientError(f"HTTP {exc.code} from {url}: {message}") from exc
         except URLError as exc:
             raise WazuhClientError(f"Unable to reach {url}: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise WazuhClientError(f"Request to {url} timed out after {self.settings.timeout:g} seconds.") from exc
         except OSError as exc:
             raise WazuhClientError(f"Network error while calling {url}: {exc}") from exc
 
@@ -139,25 +194,14 @@ class WazuhApiClient:
             return self._token
 
         headers = {"Authorization": _basic_auth_header(self.settings.username, self.settings.password)}
-        token_response = self.http.request(
+        raw_response = self.http.request(
             "POST",
             "/security/user/authenticate",
             headers=headers,
+            params={"raw": "true"},
+            expect_json=False,
         )
-        if isinstance(token_response, str):
-            token = token_response.strip()
-        else:
-            token = _nested_get(token_response, "data", "token", default="").strip()
-
-        if not token:
-            raw_response = self.http.request(
-                "POST",
-                "/security/user/authenticate",
-                headers=headers,
-                params={"raw": "true"},
-                expect_json=False,
-            )
-            token = str(raw_response).strip()
+        token = str(raw_response).strip().strip('"')
 
         if not token:
             raise WazuhClientError("Wazuh API authentication succeeded without returning a token.")
@@ -170,6 +214,7 @@ class WazuhApiClient:
         response = self.http.request(method, path, headers=headers, params=params)
         if not isinstance(response, dict):
             raise WazuhClientError(f"Unexpected non-JSON response from {path}.")
+        _ensure_wazuh_success(response, path)
         return response
 
     def fetch_overview(self) -> dict[str, Any]:
@@ -209,9 +254,21 @@ class WazuhIndexerClient:
             raise WazuhClientError("Unexpected Wazuh indexer cluster health response.")
         return response
 
-    def fetch_recent_alerts(self, limit: int = 20) -> list[dict[str, Any]]:
+    def fetch_recent_alerts(
+        self,
+        limit: int = 20,
+        index_pattern: str = "wazuh-alerts-*",
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 200))
+        index_pattern = index_pattern.strip()
+        if not index_pattern or not INDEX_PATTERN_RE.fullmatch(index_pattern):
+            raise WazuhClientError(
+                "Alert index pattern may only contain letters, numbers, dots, underscores, commas, hyphens, and *."
+            )
+
         query = {
             "size": limit,
+            "track_total_hits": False,
             "sort": [
                 {
                     "timestamp": {
@@ -222,6 +279,7 @@ class WazuhIndexerClient:
             ],
             "_source": [
                 "timestamp",
+                "@timestamp",
                 "location",
                 "manager.name",
                 "agent.id",
@@ -236,7 +294,7 @@ class WazuhIndexerClient:
         }
         response = self.http.request(
             "POST",
-            "/wazuh-alerts*/_search",
+            f"/{quote(index_pattern, safe='*,._-')}/_search",
             headers=self._headers,
             payload=query,
         )
@@ -254,12 +312,10 @@ class WazuhIndexerClient:
                 continue
             alerts.append(
                 {
-                    "timestamp": str(source.get("timestamp", "")),
-                    "severity": int(_nested_get(source, "rule", "level", default=0) or 0),
+                    "timestamp": str(source.get("timestamp") or source.get("@timestamp") or ""),
+                    "severity": _safe_int(_nested_get(source, "rule", "level", default=0)),
                     "rule_id": str(_nested_get(source, "rule", "id", default="")),
-                    "rule_description": str(
-                        _nested_get(source, "rule", "description", default="Unknown rule")
-                    ),
+                    "rule_description": str(_nested_get(source, "rule", "description", default="Unknown rule")),
                     "agent_name": str(_nested_get(source, "agent", "name", default="manager")),
                     "agent_id": str(_nested_get(source, "agent", "id", default="")),
                     "manager_name": str(_nested_get(source, "manager", "name", default="")),
@@ -269,4 +325,3 @@ class WazuhIndexerClient:
                 }
             )
         return alerts
-

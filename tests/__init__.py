@@ -1,0 +1,1 @@
+"""SIEM-Commander automated tests."""
