@@ -1,4 +1,13 @@
+<p align="center">
+  <img src="docs/social-preview.png" alt="SIEM-Commander social preview" width="100%" />
+</p>
+
 # SIEM-Commander
+
+[![CI](https://github.com/Kousiksamanta1/SIEM-Commander/actions/workflows/ci.yml/badge.svg)](https://github.com/Kousiksamanta1/SIEM-Commander/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-2cff88.svg)](LICENSE)
+[![Portfolio](https://img.shields.io/badge/Portfolio-Operator_Archive-66e3ff)](https://kousiksamanta1.github.io/PORTFOLIO/)
 
 SIEM-Commander is a production-oriented PyQt6 desktop operations console for an
 existing Wazuh deployment. It gives a SOC analyst one place to verify manager
@@ -185,6 +194,12 @@ approval workflows are designed for the target organization.
 - [Wazuh indexer API](https://documentation.wazuh.com/current/user-manual/indexer-api/getting-started.html)
 - [Wazuh index definitions](https://documentation.wazuh.com/current/user-manual/wazuh-indexer/wazuh-indexer-indices.html)
 
+## Contributing
+
+Contributions should preserve secure defaults, read-only operational scope, and
+test coverage. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development
+workflow.
+
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
